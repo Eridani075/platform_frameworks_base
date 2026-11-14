@@ -374,6 +374,7 @@ import com.android.server.pm.UserManagerInternal;
 import com.android.server.policy.WindowManagerPolicy;
 import com.android.server.policy.WindowManagerPolicy.ScreenOffListener;
 import com.android.server.power.ShutdownThread;
+import com.android.server.statusbar.StatusBarManagerInternal;
 import com.android.server.utils.PriorityDump;
 import com.android.window.flags.Flags;
 
@@ -7184,6 +7185,7 @@ public class WindowManagerService extends IWindowManager.Stub
         }
         try {
             final boolean isHome;
+            final int displayId;
             synchronized (mGlobalLock) {
                 final Task task = mRoot.anyTaskForId(taskId);
                 if (task == null) {
@@ -7193,13 +7195,20 @@ public class WindowManagerService extends IWindowManager.Stub
                     return false;
                 }
                 isHome = task.isActivityTypeHome();
+                displayId = task.getDisplayId();
             }
             if (isHome) {
-                final Intent intent = new Intent(Intent.ACTION_MAIN)
-                        .setClassName("org.uwuaosp.settingsext",
-                                "org.uwuaosp.settingsext.moment.MomentAllAppsActivity");
-                mMomentController.startActivityInMoment(intent, userId);
-                return true;
+                final StatusBarManagerInternal statusBar =
+                        LocalServices.getService(StatusBarManagerInternal.class);
+                if (statusBar == null) {
+                    Slog.w("MomentNavHandle", "Status bar service is unavailable");
+                    return false;
+                }
+                final boolean dispatched = statusBar.showMomentAllApps(displayId, userId);
+                if (!dispatched) {
+                    Slog.w("MomentNavHandle", "Cannot show Moment apps: SystemUI is not connected");
+                }
+                return dispatched;
             }
             mMomentController.convertTaskToMoment(taskId);
             return true;
