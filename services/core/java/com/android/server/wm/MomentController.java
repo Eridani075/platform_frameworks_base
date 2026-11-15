@@ -584,6 +584,15 @@ final class MomentController {
         }
     }
 
+    void setMomentResizing(Task task, boolean resizing) {
+        synchronized (mService.mGlobalLock) {
+            if (task == null || task.getWindowingMode() != WINDOWING_MODE_MOMENT) return;
+            final MomentTaskSurfaceState state = getOrCreateStateLocked(task);
+            state.setResizing(resizing);
+            applyMomentStateLocked(task, state, true /* allowSurfaceHandle */);
+        }
+    }
+
     Rect resizeMomentTask(Task task, float scale, int fixedX, int fixedY,
             boolean resizeFromLeft, boolean resizeFromTop) {
         synchronized (mService.mGlobalLock) {

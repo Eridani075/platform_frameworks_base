@@ -39,6 +39,8 @@ final class MomentTaskSurfaceState {
     private final MomentHandleSurfaces mHandleSurfaces;
     private final MomentMorphLayer mMorphLayer;
     private final MomentWindowEffects mWindowEffects;
+    private final MomentResizeEffects mResizeEffects;
+    private boolean mResizing;
     private final DisplayFrames mPortraitDisplayFrames = new DisplayFrames();
     private final InsetsState mLastRawInsetsState = new InsetsState();
 
@@ -78,6 +80,7 @@ final class MomentTaskSurfaceState {
         mHandleSurfaces = new MomentHandleSurfaces(task);
         mMorphLayer = new MomentMorphLayer(task);
         mWindowEffects = new MomentWindowEffects(task);
+        mResizeEffects = new MomentResizeEffects(task);
     }
 
     void setScale(float scale) {
@@ -103,6 +106,12 @@ final class MomentTaskSurfaceState {
 
     float getScale() {
         return mScale;
+    }
+
+    void setResizing(boolean resizing) {
+        if (mResizing == resizing) return;
+        mResizing = resizing;
+        mResizeEffects.setActive(resizing);
     }
 
     void prepareForFullscreenConversion(boolean fixedAspectRatio) {
@@ -378,6 +387,7 @@ final class MomentTaskSurfaceState {
         }
         if (mOpening || mClosing) {
             mWindowEffects.hide(t);
+            mResizeEffects.clear(t);
             t.hide(mTask.mSurfaceControl);
             mHandleSurfaces.hideBottom(t);
             return;
@@ -385,7 +395,7 @@ final class MomentTaskSurfaceState {
         updateBounds();
         mCornerRadius = MomentGeometry.getCornerRadius(getDensity());
         applyTaskTransform(t);
-        if (showHandle && !mMomentCompact && !mTransformAnimating) {
+        if (showHandle && !mMomentCompact && !mTransformAnimating && !mResizing) {
             mHandleSurfaces.showOrUpdateBottom(t, getHandleBounds());
         } else {
             mHandleSurfaces.hideBottom(t);
@@ -539,6 +549,7 @@ final class MomentTaskSurfaceState {
     }
 
     synchronized void prepareForTaskRemoval(SurfaceControl.Transaction t) {
+        mResizeEffects.clear(t);
         mWindowEffects.hide(t);
         mAnimationGeneration++;
         mTransformAnimating = false;
@@ -596,6 +607,9 @@ final class MomentTaskSurfaceState {
                 width, height, mTransformAnimating ? mAnimatedDisplayedCornerRadius
                         : mCornerRadius * scale,
                 mTransformAnimating ? mAnimatedAlpha : 1f, getDensity());
+        mResizeEffects.apply(t, mAnimatedCrop, centerX - width / 2f, centerY - height / 2f,
+                width, height, mTransformAnimating ? mAnimatedDisplayedCornerRadius
+                        : mCornerRadius * scale, getDensity());
         final MomentLayoutSnapshot snapshot = mLayoutSnapshot;
         if (snapshot != null) {
             snapshot.applyBounds(t, mAnimatedCrop, scaleX, scaleY);
@@ -611,6 +625,8 @@ final class MomentTaskSurfaceState {
     }
 
     void reset(SurfaceControl.Transaction t) {
+        setResizing(false);
+        mResizeEffects.clear(t);
         mWindowEffects.hide(t);
         if (mTask.mSurfaceControl == null) {
             return;
@@ -637,6 +653,7 @@ final class MomentTaskSurfaceState {
         mTask.setForceTranslucent(false);
         mHandleSurfaces.destroy(t);
         mWindowEffects.destroy(t);
+        mResizeEffects.destroy(t);
     }
 
     private float getDensity() {

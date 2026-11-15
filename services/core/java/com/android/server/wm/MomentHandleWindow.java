@@ -763,6 +763,7 @@ final class MomentHandleWindow {
                 final float relativeDy = Math.abs(dy / mResizeStartVectorY);
                 mResizeUsingHorizontalAxis = relativeDx >= relativeDy;
                 mResizing = true;
+                mService.mMomentController.setMomentResizing(mTask, true);
             }
             final float pointerVectorX = event.getRawX(pointerIndex) - mResizeFixedX;
             final float pointerVectorY = event.getRawY(pointerIndex) - mResizeFixedY;
@@ -790,6 +791,7 @@ final class MomentHandleWindow {
         }
 
         private void resetResizeGesture() {
+            if (mResizing) mService.mMomentController.setMomentResizing(mTask, false);
             mResizeEdges = RESIZE_EDGE_NONE;
             mResizing = false;
             mLastTapUpTime = 0;
