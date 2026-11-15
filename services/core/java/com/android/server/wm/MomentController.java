@@ -1197,7 +1197,8 @@ final class MomentController {
         final int generation = state.beginTransformAnimation(startScaleX, startScaleY,
                 startCenterX, startCenterY, startAlpha, startDisplayedCornerRadius,
                 startCropProgress);
-        state.apply(task.getSyncTransaction(), false /* showHandle */);
+        final SurfaceControl.Transaction startTransaction = task.getSyncTransaction();
+        state.apply(startTransaction, false /* showHandle */);
         if (endAction == ANIMATION_RESTORE_COMPACT) {
             updateHandleWindowLocked(task);
         } else {
@@ -1215,7 +1216,13 @@ final class MomentController {
                 Math.round(startCenterX + baseBounds.width() * startScaleX / 2f),
                 Math.round(startCenterY + baseBounds.height() * startScaleY / 2f));
         final boolean[] settlingPosted = {false};
-        mAnimationRunner.start(state, spatialSpec,
+        // IME/configuration changes can keep the task's sync transaction pending while app
+        // buffers redraw. Do not run the animation against an uncommitted initial pose: it
+        // would finish invisibly and the first presented frame would already be a small window.
+        // Use the same committed-frame handoff as the Moment open animation. The generation
+        // check in the runner discards starts after task removal or animation cancellation.
+        startTransaction.addTransactionCommittedListener(Runnable::run,
+                () -> mAnimationRunner.start(state, spatialSpec,
                 () -> state.isTransformAnimation(generation), (progress, effects) -> {
                 final float cropProgress = lerp(startCropProgress, endCropProgress, effects);
                 final float cropWidth = lerp(baseBounds.width(), contentCrop.width(), cropProgress);
@@ -1254,7 +1261,7 @@ final class MomentController {
                     });
                 }
                 }, () -> mService.mH.post(() -> onTaskTransformAnimationFinished(task.mTaskId,
-                        state, generation, endScaleX, endCenterX, endCenterY, endAction)));
+                        state, generation, endScaleX, endCenterX, endCenterY, endAction))));
     }
 
     private float getDisplayCornerRadiusLocked(Task task) {
