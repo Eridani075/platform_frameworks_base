@@ -38,6 +38,7 @@ final class MomentTaskSurfaceState {
     private final Point mCenter = new Point();
     private final MomentHandleSurfaces mHandleSurfaces;
     private final MomentMorphLayer mMorphLayer;
+    private final MomentWindowEffects mWindowEffects;
     private final DisplayFrames mPortraitDisplayFrames = new DisplayFrames();
     private final InsetsState mLastRawInsetsState = new InsetsState();
 
@@ -76,6 +77,7 @@ final class MomentTaskSurfaceState {
         mScale = scale;
         mHandleSurfaces = new MomentHandleSurfaces(task);
         mMorphLayer = new MomentMorphLayer(task);
+        mWindowEffects = new MomentWindowEffects(task);
     }
 
     void setScale(float scale) {
@@ -375,6 +377,7 @@ final class MomentTaskSurfaceState {
             return;
         }
         if (mOpening || mClosing) {
+            mWindowEffects.hide(t);
             t.hide(mTask.mSurfaceControl);
             mHandleSurfaces.hideBottom(t);
             return;
@@ -536,6 +539,7 @@ final class MomentTaskSurfaceState {
     }
 
     synchronized void prepareForTaskRemoval(SurfaceControl.Transaction t) {
+        mWindowEffects.hide(t);
         mAnimationGeneration++;
         mTransformAnimating = false;
         mOpening = false;
@@ -588,6 +592,10 @@ final class MomentTaskSurfaceState {
                 .setScale(mTask.mSurfaceControl, scaleX, scaleY)
                 .setAlpha(mTask.mSurfaceControl, mTransformAnimating ? mAnimatedAlpha : 1f)
                 .show(mTask.mSurfaceControl);
+        mWindowEffects.apply(t, centerX - width / 2f, centerY - height / 2f,
+                width, height, mTransformAnimating ? mAnimatedDisplayedCornerRadius
+                        : mCornerRadius * scale,
+                mTransformAnimating ? mAnimatedAlpha : 1f, getDensity());
         final MomentLayoutSnapshot snapshot = mLayoutSnapshot;
         if (snapshot != null) {
             snapshot.applyBounds(t, mAnimatedCrop, scaleX, scaleY);
@@ -603,6 +611,7 @@ final class MomentTaskSurfaceState {
     }
 
     void reset(SurfaceControl.Transaction t) {
+        mWindowEffects.hide(t);
         if (mTask.mSurfaceControl == null) {
             return;
         }
@@ -627,6 +636,7 @@ final class MomentTaskSurfaceState {
         cancelTransformAnimation();
         mTask.setForceTranslucent(false);
         mHandleSurfaces.destroy(t);
+        mWindowEffects.destroy(t);
     }
 
     private float getDensity() {
