@@ -55,7 +55,7 @@ final class MomentGeometry {
 
     static void getBottomHandleBounds(Rect momentBounds, float density, float widthScale,
             RectF outBounds) {
-        final float baseWidth = Math.max(1f, momentBounds.width() / 2f);
+        final float baseWidth = Math.max(1f, momentBounds.width() / 3f);
         final float width = Math.max(1f, baseWidth * widthScale);
         final float height = getBottomHandleHeight(momentBounds.width(), density);
         final float centerX = momentBounds.exactCenterX();

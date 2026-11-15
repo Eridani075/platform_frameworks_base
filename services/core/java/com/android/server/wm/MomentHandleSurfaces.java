@@ -29,7 +29,7 @@ import com.android.internal.dynamicanimation.animation.SpringAnimation;
 
 final class MomentHandleSurfaces {
 
-    private static final float PRESSED_WIDTH_SCALE = 76f / 108f;
+    private static final float PRESSED_WIDTH_SCALE = 1.15f;
 
     private final Task mTask;
     private final float[] mBottomColor = new float[3];
@@ -218,8 +218,11 @@ final class MomentHandleSurfaces {
     }
 
     private void applyBottomGeometry(SurfaceControl.Transaction t) {
-        final float widthScale = 1f - (1f - PRESSED_WIDTH_SCALE) * mPressProgress;
+        final float progress = Math.max(0f, Math.min(1.2f, mPressProgress));
+        final float widthScale = 1f + (PRESSED_WIDTH_SCALE - 1f) * progress;
         MomentGeometry.getBottomHandleBounds(mBottomBounds, getDensity(), widthScale, mTmpBounds);
+        final float extraHeight = mTmpBounds.height() * .65f * progress / 2f;
+        mTmpBounds.inset(0f, -extraHeight);
         applySurfaceBounds(t, mBottomSurface, mTmpBounds);
         if (mBottomHalo != null) {
             final RectF halo = new RectF(mTmpBounds);

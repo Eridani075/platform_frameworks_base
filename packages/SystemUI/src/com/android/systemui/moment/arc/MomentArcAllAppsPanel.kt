@@ -125,7 +125,7 @@ internal fun MomentArcAllAppsPanel(
             val interactionSource = remember { MutableInteractionSource() }
             val pressed by interactionSource.collectIsPressedAsState()
             val widthScale by animateFloatAsState(
-                targetValue = if (pressed) 76f / 108f else 1f,
+                targetValue = if (pressed) 1.15f else 1f,
                 animationSpec = spring(dampingRatio = .6f, stiffness = 800f),
                 label = "MomentArcHandlePress",
             )
@@ -151,12 +151,14 @@ internal fun MomentArcAllAppsPanel(
                             val visual = geometry.handleVisualBounds
                             val touch = geometry.handleTouchBounds
                             val width = visual.width() * widthScale
+                            val height = visual.height() *
+                                (1f + .65f * ((widthScale - 1f) / .15f).coerceIn(0f, 1.2f))
                             drawRoundRect(
                                 handleColor,
                                 topLeft = Offset(visual.centerX() - width / 2f - touch.left,
-                                    visual.top - touch.top),
-                                size = Size(width, visual.height()),
-                                cornerRadius = CornerRadius(visual.height() / 2f),
+                                    visual.centerY() - height / 2f - touch.top),
+                                size = Size(width, height),
+                                cornerRadius = CornerRadius(height / 2f),
                             )
                         }
                     }
