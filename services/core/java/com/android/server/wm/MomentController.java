@@ -749,10 +749,25 @@ final class MomentController {
                     || state.isTransformAnimating()) {
                 return;
             }
-            final Rect bounds = state.getSurfaceBounds();
-            final float endScale = clampScaleLocked(task, state, state.getCompactRestoreScale());
+            final Rect safeBounds = new Rect();
+            getMomentSafeBoundsLocked(task, safeBounds);
+            final DisplayContent display = task.getDisplayContent();
+            if (display != null) {
+                final android.graphics.Insets imeInsets = display.getInsetsStateController()
+                        .getRawInsetsState().calculateInsets(display.getBounds(), display.getBounds(),
+                                android.view.WindowInsets.Type.ime(), false);
+                safeBounds.bottom = Math.max(safeBounds.top + 1,
+                        Math.min(safeBounds.bottom, display.getBounds().bottom - imeInsets.bottom));
+            }
+            final Rect crop = state.getContentCrop();
+            final float availableHeight = Math.max(1f, safeBounds.height()
+                    - HANDLE_AREA_HEIGHT_DP * getDensityLocked(task));
+            final float endScale = Math.max(MIN_SCALE, Math.min(
+                    clampScaleLocked(task, state, state.getCompactRestoreScale()),
+                    Math.min((float) safeBounds.width() / Math.max(1, crop.width()),
+                            availableHeight / Math.max(1, crop.height()))));
             startTaskTransformAnimationLocked(task, state, endScale,
-                    bounds.exactCenterX(), bounds.exactCenterY(), 1f,
+                    safeBounds.exactCenterX(), safeBounds.exactCenterY(), 1f,
                     MomentGeometry.getCornerRadius(getDensityLocked(task)) * endScale,
                     1f,
                     MomentMotion.DEFAULT_SPATIAL, ANIMATION_RESTORE_COMPACT);
