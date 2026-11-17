@@ -853,6 +853,10 @@ public class WindowManagerService extends IWindowManager.Stub
                 Settings.Secure.getUriFor(Settings.Secure.MOMENT_ENABLED);
         private final Uri mMomentFixedAspectRatioUri =
                 Settings.Secure.getUriFor(Settings.Secure.MOMENT_FIXED_ASPECT_RATIO);
+        private final Uri mMomentAppJumpEnabledUri =
+                Settings.Secure.getUriFor(Settings.Secure.MOMENT_APP_JUMP_ENABLED);
+        private final Uri mMomentAppJumpSourcePackagesUri =
+                Settings.Secure.getUriFor(Settings.Secure.MOMENT_APP_JUMP_SOURCE_PACKAGES);
         private final Uri mPolicyControlUri =
                 Settings.Global.getUriFor(Settings.Global.POLICY_CONTROL);
         private final Uri mForceDesktopModeOnExternalDisplaysUri = Settings.Global.getUriFor(
@@ -894,6 +898,10 @@ public class WindowManagerService extends IWindowManager.Stub
             resolver.registerContentObserver(mMomentEnabledUri, false, this,
                     UserHandle.USER_ALL);
             resolver.registerContentObserver(mMomentFixedAspectRatioUri, false, this,
+                    UserHandle.USER_ALL);
+            resolver.registerContentObserver(mMomentAppJumpEnabledUri, false, this,
+                    UserHandle.USER_ALL);
+            resolver.registerContentObserver(mMomentAppJumpSourcePackagesUri, false, this,
                     UserHandle.USER_ALL);
             resolver.registerContentObserver(mPolicyControlUri, false, this, UserHandle.USER_ALL);
             if (DesktopModeHelper.isDesktopExperienceDevOptionSupported(mContext)) {
@@ -969,7 +977,9 @@ public class WindowManagerService extends IWindowManager.Stub
                 return;
             }
 
-            if (mMomentFixedAspectRatioUri.equals(uri)) {
+            if (mMomentFixedAspectRatioUri.equals(uri)
+                    || mMomentAppJumpEnabledUri.equals(uri)
+                    || mMomentAppJumpSourcePackagesUri.equals(uri)) {
                 updateMomentEnabled();
                 return;
             }
@@ -1142,6 +1152,11 @@ public class WindowManagerService extends IWindowManager.Stub
             mMomentController.setFixedAspectRatioFromSettings(Settings.Secure.getIntForUser(
                     mContext.getContentResolver(), Settings.Secure.MOMENT_FIXED_ASPECT_RATIO, 0,
                     mCurrentUserId) != 0);
+            mMomentController.setAppJumpSettingsFromSettings(mCurrentUserId,
+                    Settings.Secure.getIntForUser(mContext.getContentResolver(),
+                            Settings.Secure.MOMENT_APP_JUMP_ENABLED, 0, mCurrentUserId) != 0,
+                    Settings.Secure.getStringForUser(mContext.getContentResolver(),
+                            Settings.Secure.MOMENT_APP_JUMP_SOURCE_PACKAGES, mCurrentUserId));
         }
     }
 

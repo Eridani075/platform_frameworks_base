@@ -17,8 +17,11 @@
 package com.android.server.wm;
 
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
+import static android.app.WindowConfiguration.ACTIVITY_TYPE_STANDARD;
+import static android.app.WindowConfiguration.ACTIVITY_TYPE_UNDEFINED;
 import static android.app.WindowConfiguration.WINDOWING_MODE_FULLSCREEN;
 import static android.app.WindowConfiguration.WINDOWING_MODE_MOMENT;
+import static android.app.WindowConfiguration.WINDOWING_MODE_UNDEFINED;
 
 import static com.android.server.wm.MomentGeometry.COMPACT_DISMISS_TARGET_SIZE_DP;
 import static com.android.server.wm.MomentGeometry.HANDLE_AREA_HEIGHT_DP;
@@ -28,14 +31,19 @@ import static com.android.server.wm.MomentGeometry.HANDLE_MENU_WIDTH_DP;
 import android.app.ActivityOptions;
 import android.app.ActivityThread;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.ApplicationInfo;
 import android.graphics.Rect;
 import android.hardware.input.InputManager;
 import android.os.Binder;
 import android.os.Bundle;
+import android.os.Process;
 import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.util.ArrayMap;
+import android.util.ArraySet;
 import android.util.Slog;
 import android.view.InputDevice;
 import android.view.KeyCharacterMap;
@@ -72,9 +80,13 @@ final class MomentController {
     private final ArrayMap<Integer, MomentLayoutSnapshot> mLayoutSnapshots = new ArrayMap<>();
     private final ArrayMap<Integer, MomentHandleWindow> mHandleWindows = new ArrayMap<>();
     private final MomentTaskAnimationRunner mAnimationRunner;
+    private final ArraySet<String> mAppJumpSourcePackages = new ArraySet<>();
+    private final ArrayMap<Integer, AppJumpSession> mAppJumpSessions = new ArrayMap<>();
 
     private boolean mEnabled;
     private boolean mFixedAspectRatio;
+    private boolean mAppJumpEnabled;
+    private int mAppJumpUserId = UserHandle.USER_NULL;
     private float mDefaultScale = DEFAULT_SCALE;
 
     MomentController(WindowManagerService service) {
@@ -92,6 +104,7 @@ final class MomentController {
         synchronized (mService.mGlobalLock) {
             mEnabled = enabled;
             if (!enabled) {
+                mAppJumpSessions.clear();
                 exitAllForUserLocked(mService.mCurrentUserId);
             }
         }
@@ -232,6 +245,272 @@ final class MomentController {
     boolean isEnabledForUser(int userId) {
         return Settings.Secure.getIntForUser(mService.mContext.getContentResolver(),
                 Settings.Secure.MOMENT_ENABLED, 0, userId) != 0;
+    }
+
+    void setAppJumpSettingsFromSettings(int userId, boolean enabled, String packages) {
+        synchronized (mService.mGlobalLock) {
+            if (mAppJumpUserId != userId) {
+                mAppJumpSessions.clear();
+            }
+            mAppJumpUserId = userId;
+            mAppJumpEnabled = enabled;
+            mAppJumpSourcePackages.clear();
+            if (packages != null) {
+                for (String packageName : packages.split(":")) {
+                    if (!packageName.isBlank()) {
+                        mAppJumpSourcePackages.add(packageName.trim());
+                    }
+                }
+            }
+        }
+    }
+
+    /** Internal launch state; never accepted from an app's Intent or ActivityOptions. */
+    static final class AppJumpLaunch {
+        final Task sourceTask;
+        final String sourcePackage;
+        final String targetPackage;
+        final ActivityOptions options;
+        final AppJumpSession returningSession;
+        final ArraySet<ActivityRecord> originalActivities = new ArraySet<>();
+        Task existingTask;
+
+        AppJumpLaunch(Task sourceTask, String sourcePackage, String targetPackage,
+                ActivityOptions options, AppJumpSession returningSession) {
+            this.sourceTask = sourceTask;
+            this.sourcePackage = sourcePackage;
+            this.targetPackage = targetPackage;
+            this.options = options;
+            this.returningSession = returningSession;
+        }
+
+        boolean isReturnToSource() {
+            return returningSession != null;
+        }
+    }
+
+    private static final class AppJumpSession {
+        final Task task;
+        final Task sourceTask;
+        final String sourcePackage;
+        final ActivityRecord entryActivity;
+        final boolean wasExistingTask;
+        final ArraySet<ActivityRecord> originalActivities;
+        boolean dismissCheckScheduled;
+        boolean dismissRequested;
+
+        AppJumpSession(Task task, AppJumpLaunch launch, ActivityRecord entryActivity) {
+            this.task = task;
+            sourceTask = launch.sourceTask;
+            sourcePackage = launch.sourcePackage;
+            this.entryActivity = entryActivity;
+            wasExistingTask = launch.existingTask != null;
+            originalActivities = launch.originalActivities;
+        }
+    }
+
+    AppJumpLaunch prepareAppJumpMomentLaunchLocked(Intent intent, ActivityInfo target,
+            ActivityRecord source, String callingPackage, int callingUid, int userId,
+            ActivityOptions options, Task inTask, TaskFragment inTaskFragment) {
+        if (target == null || target.packageName == null || userId != mService.mCurrentUserId
+                || (intent != null && ActivityRecord.isHomeIntent(intent))) {
+            return null;
+        }
+        Task callerTask = source != null ? source.getTask()
+                : mService.mRoot.getTopDisplayFocusedRootTask();
+        if (source == null && callerTask != null) {
+            final ActivityRecord top = callerTask.getTopNonFinishingActivity();
+            if (top == null || !top.packageName.equals(callingPackage)
+                    || top.getUid() != callingUid) {
+                callerTask = null;
+            }
+        }
+        final AppJumpSession returning = callerTask != null
+                ? mAppJumpSessions.get(callerTask.getRootTaskId()) : null;
+        if (returning != null
+                && callerTask.getWindowingMode() == WINDOWING_MODE_MOMENT
+                && returning.sourcePackage.equals(target.packageName)
+                && returning.sourceTask.isAttached()
+                && returning.sourceTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+                && returning.sourceTask.mUserId == userId) {
+            final ActivityOptions returnOptions = copyAppJumpOptions(options);
+            returnOptions.setLaunchWindowingMode(WINDOWING_MODE_FULLSCREEN);
+            returnOptions.setLaunchBounds(null);
+            return new AppJumpLaunch(returning.sourceTask, returning.sourcePackage,
+                    target.packageName, returnOptions, returning);
+        }
+        if (!mEnabled || !mAppJumpEnabled || mAppJumpUserId != userId
+                || mAppJumpSourcePackages.isEmpty() || !Process.isApplicationUid(callingUid)
+                || target.applicationInfo == null
+                || (target.applicationInfo.flags
+                        & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP))
+                        != 0
+                || ActivityStartInterceptor.isAllowedSystemMediatorTarget(target)
+                || inTask != null || inTaskFragment != null) {
+            return null;
+        }
+        if (options != null
+                && ((options.getLaunchWindowingMode() != WINDOWING_MODE_UNDEFINED
+                        && options.getLaunchWindowingMode() != WINDOWING_MODE_FULLSCREEN)
+                        || (options.getLaunchActivityType() != ACTIVITY_TYPE_UNDEFINED
+                        && options.getLaunchActivityType() != ACTIVITY_TYPE_STANDARD)
+                        || options.getLaunchTaskId() != INVALID_TASK_ID
+                        || options.getLaunchRootTask() != null
+                        || options.getLaunchTaskFragmentToken() != null
+                        || options.isLaunchIntoPip())) {
+            return null;
+        }
+        final boolean fromResolver = "com.android.intentresolver".equals(callingPackage)
+                || (source != null && (source.isResolverOrDelegateActivity()
+                        || "com.android.intentresolver".equals(source.packageName)));
+        final DisplayContent display = source != null ? source.getDisplayContent()
+                : mService.getDefaultDisplayContentLocked();
+        if (display == null) {
+            return null;
+        }
+        if (fromResolver || source == null || !source.packageName.equals(callingPackage)) {
+            // Chooser may be in its own task or on top of the original app's task.
+            source = display.getActivity(activity -> isAppJumpSourceActivity(activity, userId)
+                    && !ActivityStartInterceptor.isAllowedSystemMediatorTarget(activity.info)
+                    && !activity.isResolverOrDelegateActivity()
+                    && (fromResolver || (activity.packageName.equals(callingPackage)
+                            && activity.getUid() == callingUid)));
+        }
+        if (!isAppJumpSourceActivity(source, userId)
+                || !mAppJumpSourcePackages.contains(source.packageName)
+                || source.packageName.equals(target.packageName)
+                || (!fromResolver && source.getUid() != callingUid)
+                || (options != null && options.getLaunchDisplayId() != -1
+                        && options.getLaunchDisplayId() != display.getDisplayId())) {
+            return null;
+        }
+        final ActivityOptions launchOptions = copyAppJumpOptions(options);
+        launchOptions.setLaunchWindowingMode(WINDOWING_MODE_MOMENT);
+        launchOptions.setLaunchDisplayId(display.getDisplayId());
+        final Rect bounds = display.getBounds();
+        if (bounds.width() > bounds.height()) {
+            launchOptions.setLaunchBounds(new Rect(0, 0, bounds.height(), bounds.width()));
+        }
+        return new AppJumpLaunch(source.getTask(), source.packageName, target.packageName,
+                launchOptions, null /* returningSession */);
+    }
+
+    private static ActivityOptions copyAppJumpOptions(ActivityOptions options) {
+        return options != null ? ActivityOptions.fromBundle(options.toBundle())
+                : ActivityOptions.makeBasic();
+    }
+
+    private static boolean isAppJumpSourceActivity(ActivityRecord activity, int userId) {
+        return activity != null && !activity.finishing && activity.mUserId == userId
+                && activity.isVisibleRequested() && activity.getTask() != null
+                && activity.getTask().isActivityTypeStandard()
+                && activity.getTask().getWindowingMode() == WINDOWING_MODE_FULLSCREEN;
+    }
+
+    boolean canReuseAppJumpTaskLocked(AppJumpLaunch launch, Task task) {
+        if (task == null || task == launch.sourceTask || task.getRootTask() != task
+                || !task.isLeafTask() || !task.isActivityTypeStandard()
+                || task.mUserId != launch.sourceTask.mUserId
+                || task.getDisplayId() != launch.sourceTask.getDisplayId()) {
+            return false;
+        }
+        final AppJumpSession session = mAppJumpSessions.get(task.mTaskId);
+        if (task.getWindowingMode() == WINDOWING_MODE_MOMENT) {
+            return session != null && !session.dismissRequested
+                    && session.sourceTask == launch.sourceTask;
+        }
+        final ActivityRecord root = task.getRootActivity();
+        return task.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+                && !task.isVisibleRequested() && root != null
+                && launch.targetPackage.equals(root.packageName);
+    }
+
+    void onAppJumpTaskResolvedLocked(AppJumpLaunch launch, Task task) {
+        if (launch.returningSession == null && task != null) {
+            launch.existingTask = task;
+            task.forAllActivities(activity -> {
+                launch.originalActivities.add(activity);
+            });
+        }
+    }
+
+    void onAppJumpLaunchSucceededLocked(AppJumpLaunch launch, ActivityRecord entry) {
+        if (launch.returningSession != null) {
+            dismissAppJumpTaskLocked(launch.returningSession);
+            return;
+        }
+        final Task task = entry != null ? entry.getTask() : null;
+        if (task == null || task == launch.sourceTask
+                || task.getWindowingMode() != WINDOWING_MODE_MOMENT
+                || mAppJumpSessions.containsKey(task.mTaskId)) {
+            return;
+        }
+        mAppJumpSessions.put(task.mTaskId, new AppJumpSession(task, launch, entry));
+    }
+
+    void onAppJumpLaunchFailedLocked(AppJumpLaunch launch) {
+        final Task task = launch.existingTask;
+        if (task != null && task.isAttached()
+                && task.getWindowingMode() == WINDOWING_MODE_MOMENT
+                && !mAppJumpSessions.containsKey(task.mTaskId)) {
+            exitMomentTaskLocked(task, false /* captureSnapshot */);
+            task.moveTaskToBack(task);
+        }
+    }
+
+    void onAppJumpActivityFinishingLocked(ActivityRecord activity) {
+        final Task task = activity.getTask();
+        final AppJumpSession session = task != null
+                ? mAppJumpSessions.get(task.getRootTaskId()) : null;
+        if (session == null || session.dismissRequested || session.dismissCheckScheduled
+                || !session.entryActivity.finishing) {
+            return;
+        }
+        session.dismissCheckScheduled = true;
+        // Check after result delivery and synchronous in-app trampolines have completed.
+        mService.mH.post(() -> {
+            synchronized (mService.mGlobalLock) {
+                session.dismissCheckScheduled = false;
+                if (mAppJumpSessions.get(session.task.mTaskId) != session
+                        || session.task.isClearingToReuseTask()) {
+                    return;
+                }
+                final ActivityRecord top = session.task.getTopNonFinishingActivity();
+                if (top == null || session.originalActivities.contains(top)) {
+                    dismissAppJumpTaskLocked(session);
+                }
+            }
+        });
+    }
+
+    private void dismissAppJumpTaskLocked(AppJumpSession session) {
+        if (mAppJumpSessions.get(session.task.mTaskId) != session || session.dismissRequested) {
+            return;
+        }
+        session.dismissRequested = true;
+        finishAppJumpWhenReadyLocked(session, SystemClock.uptimeMillis()
+                + OPEN_REVEAL_TIMEOUT_MS);
+    }
+
+    private void finishAppJumpWhenReadyLocked(AppJumpSession session, long deadline) {
+        final Task task = session.task;
+        if (mAppJumpSessions.get(task.mTaskId) != session || !task.isAttached()
+                || task.getWindowingMode() != WINDOWING_MODE_MOMENT) {
+            return;
+        }
+        final MomentTaskSurfaceState state = getOrCreateStateLocked(task);
+        if ((state.isOpening() || state.isTransformAnimating())
+                && SystemClock.uptimeMillis() < deadline) {
+            mService.mH.postDelayed(() -> {
+                synchronized (mService.mGlobalLock) {
+                    finishAppJumpWhenReadyLocked(session, deadline);
+                }
+            }, 16);
+        } else if (state.isMomentCompact() || state.isOpening() || state.isTransformAnimating()) {
+            closeMomentTaskLocked(task);
+        } else {
+            startMomentCloseAnimationLocked(task, state);
+        }
     }
 
     boolean shouldSuppressRelaunchForConversion(ActivityRecord activity) {
@@ -412,6 +691,12 @@ final class MomentController {
     void onTaskRemoved(Task task) {
         synchronized (mService.mGlobalLock) {
             if (task != null) {
+                mAppJumpSessions.remove(task.mTaskId);
+                for (int i = mAppJumpSessions.size() - 1; i >= 0; i--) {
+                    if (mAppJumpSessions.valueAt(i).sourceTask == task) {
+                        mAppJumpSessions.removeAt(i);
+                    }
+                }
                 removeLayoutSnapshotLocked(task.mTaskId);
             }
             removeHandleWindowLocked(task);
@@ -430,6 +715,7 @@ final class MomentController {
             if (task == null) {
                 return;
             }
+            mAppJumpSessions.remove(task.mTaskId);
             removeHandleWindowLocked(task);
             final MomentTaskSurfaceState state = mStates.remove(task.mTaskId);
             if (state == null) {
@@ -1377,6 +1663,13 @@ final class MomentController {
     }
 
     private void closeMomentTaskLocked(Task task) {
+        final AppJumpSession session = mAppJumpSessions.remove(task.mTaskId);
+        if (session != null && session.dismissRequested && session.wasExistingTask) {
+            // Restore the user's existing task only after the Moment close morph has finished.
+            exitMomentTaskLocked(task, false /* captureSnapshot */);
+            task.moveTaskToBack(task);
+            return;
+        }
         removeLayoutSnapshotLocked(task.mTaskId);
         removeHandleWindowLocked(task);
         final MomentTaskSurfaceState state = mStates.get(task.mTaskId);
@@ -1436,8 +1729,16 @@ final class MomentController {
     }
 
     private void exitMomentTaskLocked(Task task) {
+        exitMomentTaskLocked(task, true /* captureSnapshot */);
+    }
+
+    private void exitMomentTaskLocked(Task task, boolean captureSnapshot) {
+        mAppJumpSessions.remove(task.mTaskId);
+        if (!captureSnapshot) {
+            removeLayoutSnapshotLocked(task.mTaskId);
+        }
         final MomentTaskSurfaceState currentState = getStateLocked(task);
-        if (currentState != null && currentState.hasFixedAspectRatio()
+        if (captureSnapshot && currentState != null && currentState.hasFixedAspectRatio()
                 && !mLayoutSnapshots.containsKey(task.mTaskId)) {
             captureLayoutSnapshotLocked(task, currentState.getContentCrop());
         }

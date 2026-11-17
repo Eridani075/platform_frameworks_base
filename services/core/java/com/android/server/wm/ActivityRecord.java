@@ -4092,6 +4092,7 @@ final class ActivityRecord extends WindowToken {
             return;
         }
         finishing = true;
+        mWmService.mMomentController.onAppJumpActivityFinishingLocked(this);
 
         // Clear the lock task if needed when the task ends.
         if (task != null && task.getTopNonFinishingActivity() == null
