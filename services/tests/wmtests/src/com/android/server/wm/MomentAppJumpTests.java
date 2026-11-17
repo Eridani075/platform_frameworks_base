@@ -16,6 +16,8 @@
 
 package com.android.server.wm;
 
+import static android.app.Activity.RESULT_CANCELED;
+import static android.app.Activity.RESULT_OK;
 import static android.app.WindowConfiguration.WINDOWING_MODE_FULLSCREEN;
 import static android.app.WindowConfiguration.WINDOWING_MODE_MOMENT;
 
@@ -211,6 +213,64 @@ public class MomentAppJumpTests extends WindowTestsBase {
 
         mMoment.onTaskLeftMomentWindowingMode(task);
         assertNull(prepare(callback, entry, TARGET, entry.getUid(), null));
+    }
+
+    @Test
+    public void onlyEmptyCanceledEntryResultIsDeferred() {
+        final ActivityRecord entry = createMomentEntry();
+        entry.resultTo = mSource;
+        entry.requestCode = 10103;
+        assertFalse(mMoment.deferAppJumpCanceledResultLocked(entry, RESULT_OK, null));
+        assertFalse(mMoment.deferAppJumpCanceledResultLocked(entry, RESULT_CANCELED,
+                new Intent("com.test.ACTUAL_RESULT")));
+        final ActivityRecord child = new ActivityBuilder(mAtm).setTask(entry.getTask())
+                .setComponent(new ComponentName(TARGET, TARGET + ".SharePage")).build();
+        child.resultTo = mSource;
+        assertFalse(mMoment.deferAppJumpCanceledResultLocked(child, RESULT_CANCELED, null));
+        assertTrue(mMoment.deferAppJumpCanceledResultLocked(entry, RESULT_CANCELED, null));
+    }
+
+    @Test
+    public void manualExpansionKeepsPendingSdkCallbackWithoutClosingFullscreenTask() {
+        final ActivityRecord entry = createMomentEntry();
+        final Task task = entry.getTask();
+        entry.resultTo = mSource;
+        entry.requestCode = 10103;
+        assertTrue(mMoment.deferAppJumpCanceledResultLocked(entry, RESULT_CANCELED, null));
+
+        mMoment.exitMomentTask(task.mTaskId);
+
+        assertEquals(WINDOWING_MODE_FULLSCREEN, task.getWindowingMode());
+        final ActivityInfo callback = target(SOURCE, SOURCE + ".SdkCallbackActivity");
+        final MomentController.AppJumpLaunch returning = prepare(callback, entry,
+                TARGET, entry.getUid(), null);
+        assertNotNull(returning);
+        assertTrue(returning.isReturnToSource());
+        mMoment.onAppJumpLaunchSucceededLocked(returning, mSource);
+        assertTrue(task.isAttached());
+        assertEquals(WINDOWING_MODE_FULLSCREEN, task.getWindowingMode());
+        assertNull(prepare(callback, entry, TARGET, entry.getUid(), null));
+    }
+
+    @Test
+    public void emptyTaskWaitsForHandoffUntilSessionIsReleased() {
+        final ActivityRecord entry = createMomentEntry();
+        final Task task = entry.getTask();
+        assertFalse(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(task));
+        entry.makeFinishingLocked();
+        assertTrue(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(task));
+        mMoment.setEnabledFromSettings(false);
+        assertFalse(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(task));
+    }
+
+    private ActivityRecord createMomentEntry() {
+        final MomentController.AppJumpLaunch launch = prepare(mTarget);
+        assertNotNull(launch);
+        final ActivityRecord entry = new ActivityBuilder(mAtm).setCreateTask(true)
+                .setComponent(new ComponentName(TARGET, TARGET + ".Share")).build();
+        entry.getTask().setWindowingMode(WINDOWING_MODE_MOMENT);
+        mMoment.onAppJumpLaunchSucceededLocked(launch, entry);
+        return entry;
     }
 
     private MomentController.AppJumpLaunch prepare(ActivityInfo target) {

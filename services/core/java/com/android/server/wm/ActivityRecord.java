@@ -3523,6 +3523,10 @@ final class ActivityRecord extends WindowToken {
      */
     private void finishActivityResults(int resultCode, Intent resultData,
             NeededUriGrants resultGrants) {
+        if (mWmService.mMomentController.deferAppJumpCanceledResultLocked(
+                this, resultCode, resultData)) {
+            resultTo = null;
+        }
         // Send the result if needed
         if (resultTo != null) {
             if (DEBUG_RESULTS) {

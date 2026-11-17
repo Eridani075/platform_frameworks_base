@@ -16,6 +16,7 @@
 
 package com.android.server.wm;
 
+import static android.app.Activity.RESULT_CANCELED;
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_STANDARD;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_UNDEFINED;
@@ -104,7 +105,6 @@ final class MomentController {
         synchronized (mService.mGlobalLock) {
             mEnabled = enabled;
             if (!enabled) {
-                mAppJumpSessions.clear();
                 exitAllForUserLocked(mService.mCurrentUserId);
             }
         }
@@ -250,7 +250,7 @@ final class MomentController {
     void setAppJumpSettingsFromSettings(int userId, boolean enabled, String packages) {
         synchronized (mService.mGlobalLock) {
             if (mAppJumpUserId != userId) {
-                mAppJumpSessions.clear();
+                clearAppJumpSessionsLocked();
             }
             mAppJumpUserId = userId;
             mAppJumpEnabled = enabled;
@@ -293,19 +293,18 @@ final class MomentController {
         final Task task;
         final Task sourceTask;
         final String sourcePackage;
-        final ActivityRecord entryActivity;
         final boolean wasExistingTask;
-        final ArraySet<ActivityRecord> originalActivities;
+        final MomentAppJumpHandoff<ActivityRecord> handoff;
         boolean dismissCheckScheduled;
         boolean dismissRequested;
+        boolean autoDismiss = true;
 
         AppJumpSession(Task task, AppJumpLaunch launch, ActivityRecord entryActivity) {
             this.task = task;
             sourceTask = launch.sourceTask;
             sourcePackage = launch.sourcePackage;
-            this.entryActivity = entryActivity;
             wasExistingTask = launch.existingTask != null;
-            originalActivities = launch.originalActivities;
+            handoff = new MomentAppJumpHandoff<>(entryActivity, launch.originalActivities);
         }
     }
 
@@ -328,7 +327,9 @@ final class MomentController {
         final AppJumpSession returning = callerTask != null
                 ? mAppJumpSessions.get(callerTask.getRootTaskId()) : null;
         if (returning != null
-                && callerTask.getWindowingMode() == WINDOWING_MODE_MOMENT
+                && (callerTask.getWindowingMode() == WINDOWING_MODE_MOMENT
+                        || (!returning.autoDismiss
+                        && callerTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN))
                 && returning.sourcePackage.equals(target.packageName)
                 && returning.sourceTask.isAttached()
                 && returning.sourceTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
@@ -416,11 +417,11 @@ final class MomentController {
         }
         final AppJumpSession session = mAppJumpSessions.get(task.mTaskId);
         if (task.getWindowingMode() == WINDOWING_MODE_MOMENT) {
-            return session != null && !session.dismissRequested
+            return session != null && session.autoDismiss && !session.dismissRequested
                     && session.sourceTask == launch.sourceTask;
         }
         final ActivityRecord root = task.getRootActivity();
-        return task.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+        return session == null && task.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
                 && !task.isVisibleRequested() && root != null
                 && launch.targetPackage.equals(root.packageName);
     }
@@ -436,7 +437,13 @@ final class MomentController {
 
     void onAppJumpLaunchSucceededLocked(AppJumpLaunch launch, ActivityRecord entry) {
         if (launch.returningSession != null) {
-            dismissAppJumpTaskLocked(launch.returningSession);
+            launch.returningSession.handoff.onReturnToSource();
+            if (launch.returningSession.autoDismiss) {
+                dismissAppJumpTaskLocked(launch.returningSession);
+            } else {
+                releaseAppJumpSessionLocked(mAppJumpSessions.remove(
+                        launch.returningSession.task.mTaskId));
+            }
             return;
         }
         final Task task = entry != null ? entry.getTask() : null;
@@ -462,13 +469,63 @@ final class MomentController {
         final Task task = activity.getTask();
         final AppJumpSession session = task != null
                 ? mAppJumpSessions.get(task.getRootTaskId()) : null;
-        if (session == null || session.dismissRequested || session.dismissCheckScheduled
-                || !session.entryActivity.finishing) {
+        if (session == null) {
+            return;
+        }
+        session.handoff.onActivityFinishing(activity, SystemClock.uptimeMillis());
+        scheduleAppJumpDismissCheckLocked(session);
+    }
+
+    void onAppJumpActivityLaunchedLocked(ActivityRecord activity) {
+        final Task task = activity != null ? activity.getTask() : null;
+        final AppJumpSession session = task != null
+                ? mAppJumpSessions.get(task.getRootTaskId()) : null;
+        if (session == null || session.handoff.hasReturnedToSource()) {
+            return;
+        }
+        session.handoff.onActivityLaunched(activity, SystemClock.uptimeMillis());
+        if (session.dismissRequested) {
+            cancelAppJumpDismissLocked(session);
+        }
+        scheduleAppJumpDismissCheckLocked(session);
+    }
+
+    boolean deferAppJumpCanceledResultLocked(ActivityRecord activity, int resultCode,
+            Intent resultData) {
+        if (resultCode != RESULT_CANCELED || resultData != null || activity.resultTo == null) {
+            return false;
+        }
+        final Task task = activity.getTask();
+        final AppJumpSession session = task != null
+                ? mAppJumpSessions.get(task.getRootTaskId()) : null;
+        if (session == null) {
+            return false;
+        }
+        final ActivityRecord receiver = activity.resultTo;
+        final String resultWho = activity.resultWho;
+        final int requestCode = activity.requestCode;
+        final int callingUid = activity.getUid();
+        return session.handoff.deferCanceledResult(activity, () -> {
+            if (receiver.isInRootTaskLocked() && !receiver.finishing) {
+                receiver.sendResult(callingUid, resultWho, requestCode, RESULT_CANCELED,
+                        null /* data */, new Binder(), null /* dataGrants */);
+            }
+        });
+    }
+
+    boolean shouldDeferEmptyAppJumpTaskRemovalLocked(Task task) {
+        final AppJumpSession session = mAppJumpSessions.get(task.mTaskId);
+        return session != null && session.handoff.isEntryFinished() && !task.mInRemoveTask
+                && task.getTopNonFinishingActivity() == null && !task.isClearingToReuseTask();
+    }
+
+    private void scheduleAppJumpDismissCheckLocked(AppJumpSession session) {
+        if (!session.handoff.isEntryFinished() || session.dismissRequested
+                || session.dismissCheckScheduled) {
             return;
         }
         session.dismissCheckScheduled = true;
-        // Check after result delivery and synchronous in-app trampolines have completed.
-        mService.mH.post(() -> {
+        mService.mH.postDelayed(() -> {
             synchronized (mService.mGlobalLock) {
                 session.dismissCheckScheduled = false;
                 if (mAppJumpSessions.get(session.task.mTaskId) != session
@@ -476,11 +533,65 @@ final class MomentController {
                     return;
                 }
                 final ActivityRecord top = session.task.getTopNonFinishingActivity();
-                if (top == null || session.originalActivities.contains(top)) {
-                    dismissAppJumpTaskLocked(session);
+                final long now = SystemClock.uptimeMillis();
+                if (session.handoff.remainingDelay(now) > 0) {
+                    scheduleAppJumpDismissCheckLocked(session);
+                } else if (session.handoff.shouldDismiss(top, now)) {
+                    if (session.autoDismiss) {
+                        dismissAppJumpTaskLocked(session);
+                    } else {
+                        releaseAppJumpSessionLocked(mAppJumpSessions.remove(session.task.mTaskId));
+                    }
+                }
+            }
+        }, session.handoff.remainingDelay(SystemClock.uptimeMillis()));
+    }
+
+    private void cancelAppJumpDismissLocked(AppJumpSession session) {
+        session.dismissRequested = false;
+        final MomentTaskSurfaceState state = getStateLocked(session.task);
+        if (state != null && state.isClosing()) {
+            cancelTaskAnimationLocked(session.task, state);
+            state.cancelCloseAnimation(session.task.getSyncTransaction(), true /* restoreTask */);
+            updateHandleWindowLocked(session.task);
+            scheduleMomentSurfaceUpdateLocked(session.task);
+        }
+    }
+
+    private void releaseAppJumpSessionLocked(AppJumpSession session) {
+        if (session == null) {
+            return;
+        }
+        session.handoff.finish();
+        // Releasing ownership must also release any empty task kept for an async handoff.
+        mService.mH.post(() -> {
+            synchronized (mService.mGlobalLock) {
+                if (!mAppJumpSessions.containsKey(session.task.mTaskId)
+                        && session.task.isAttached() && !session.task.hasChild()) {
+                    session.task.removeIfPossible("app-jump-session-ended");
                 }
             }
         });
+    }
+
+    private void clearAppJumpSessionsLocked() {
+        final ArrayList<AppJumpSession> sessions = new ArrayList<>(mAppJumpSessions.values());
+        mAppJumpSessions.clear();
+        for (AppJumpSession session : sessions) {
+            releaseAppJumpSessionLocked(session);
+        }
+    }
+
+    private void stopAppJumpWindowOwnershipLocked(Task task) {
+        final AppJumpSession session = mAppJumpSessions.get(task.mTaskId);
+        if (session != null && session.handoff.hasPendingCanceledResult()) {
+            // A manual expansion ends automatic window ownership, but not an outstanding
+            // SDK handoff. Keep its provisional cancel until completion or a real callback.
+            session.autoDismiss = false;
+            session.dismissRequested = false;
+        } else {
+            releaseAppJumpSessionLocked(mAppJumpSessions.remove(task.mTaskId));
+        }
     }
 
     private void dismissAppJumpTaskLocked(AppJumpSession session) {
@@ -496,6 +607,14 @@ final class MomentController {
         final Task task = session.task;
         if (mAppJumpSessions.get(task.mTaskId) != session || !task.isAttached()
                 || task.getWindowingMode() != WINDOWING_MODE_MOMENT) {
+            return;
+        }
+        if (!session.dismissRequested) {
+            return;
+        }
+        if (!session.handoff.hasReturnedToSource()
+                && session.handoff.hasFlowActivity(task.getTopNonFinishingActivity())) {
+            cancelAppJumpDismissLocked(session);
             return;
         }
         final MomentTaskSurfaceState state = getOrCreateStateLocked(task);
@@ -691,10 +810,15 @@ final class MomentController {
     void onTaskRemoved(Task task) {
         synchronized (mService.mGlobalLock) {
             if (task != null) {
-                mAppJumpSessions.remove(task.mTaskId);
+                final AppJumpSession removed = mAppJumpSessions.remove(task.mTaskId);
+                if (removed != null) {
+                    removed.handoff.finish();
+                }
                 for (int i = mAppJumpSessions.size() - 1; i >= 0; i--) {
                     if (mAppJumpSessions.valueAt(i).sourceTask == task) {
+                        final AppJumpSession session = mAppJumpSessions.valueAt(i);
                         mAppJumpSessions.removeAt(i);
+                        releaseAppJumpSessionLocked(session);
                     }
                 }
                 removeLayoutSnapshotLocked(task.mTaskId);
@@ -715,7 +839,7 @@ final class MomentController {
             if (task == null) {
                 return;
             }
-            mAppJumpSessions.remove(task.mTaskId);
+            stopAppJumpWindowOwnershipLocked(task);
             removeHandleWindowLocked(task);
             final MomentTaskSurfaceState state = mStates.remove(task.mTaskId);
             if (state == null) {
@@ -1663,8 +1787,19 @@ final class MomentController {
     }
 
     private void closeMomentTaskLocked(Task task) {
+        final AppJumpSession currentSession = mAppJumpSessions.get(task.mTaskId);
+        if (currentSession != null && currentSession.dismissRequested
+                && !currentSession.handoff.hasReturnedToSource()
+                && currentSession.handoff.hasFlowActivity(task.getTopNonFinishingActivity())) {
+            cancelAppJumpDismissLocked(currentSession);
+            return;
+        }
         final AppJumpSession session = mAppJumpSessions.remove(task.mTaskId);
-        if (session != null && session.dismissRequested && session.wasExistingTask) {
+        if (session != null) {
+            session.handoff.finish();
+        }
+        if (session != null && session.dismissRequested && session.wasExistingTask
+                && task.hasChild()) {
             // Restore the user's existing task only after the Moment close morph has finished.
             exitMomentTaskLocked(task, false /* captureSnapshot */);
             task.moveTaskToBack(task);
@@ -1733,7 +1868,7 @@ final class MomentController {
     }
 
     private void exitMomentTaskLocked(Task task, boolean captureSnapshot) {
-        mAppJumpSessions.remove(task.mTaskId);
+        stopAppJumpWindowOwnershipLocked(task);
         if (!captureSnapshot) {
             removeLayoutSnapshotLocked(task.mTaskId);
         }

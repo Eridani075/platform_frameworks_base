@@ -1912,6 +1912,11 @@ class ActivityStarter {
             mService.mWindowManager.mMomentController
                     .onAppJumpLaunchFailedLocked(mMomentAppJumpLaunch);
         }
+        if (result == START_SUCCESS || result == START_DELIVERED_TO_TOP
+                || result == START_TASK_TO_FRONT) {
+            mService.mWindowManager.mMomentController.onAppJumpActivityLaunchedLocked(
+                    mLastStartActivityRecord);
+        }
 
         if (android.security.Flags.contentUriPermissionApis() && started.isAttached()) {
             started.computeInitialCallerInfo();
