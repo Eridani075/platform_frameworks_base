@@ -13441,11 +13441,17 @@ public final class Settings {
         @Readable
         public static final String MOMENT_FIXED_ASPECT_RATIO = "moment_fixed_aspect_ratio";
 
-        /** Whether cross-app launches from selected apps open in Moment. @hide */
+        /**
+         * Whether cross-app launches from selected apps open in Moment.
+         * @hide
+         */
         @Readable
         public static final String MOMENT_APP_JUMP_ENABLED = "moment_app_jump_enabled";
 
-        /** Colon-separated source packages whose cross-app launches open in Moment. @hide */
+        /**
+         * Colon-separated source packages whose cross-app launches open in Moment.
+         * @hide
+         */
         @Readable
         public static final String MOMENT_APP_JUMP_SOURCE_PACKAGES =
                 "moment_app_jump_source_packages";
