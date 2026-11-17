@@ -272,16 +272,24 @@ final class MomentController {
         final String targetPackage;
         final ActivityOptions options;
         final AppJumpSession returningSession;
+        final AppJumpSession continuingSession;
         final ArraySet<ActivityRecord> originalActivities = new ArraySet<>();
         Task existingTask;
 
         AppJumpLaunch(Task sourceTask, String sourcePackage, String targetPackage,
                 ActivityOptions options, AppJumpSession returningSession) {
+            this(sourceTask, sourcePackage, targetPackage, options, returningSession, null);
+        }
+
+        AppJumpLaunch(Task sourceTask, String sourcePackage, String targetPackage,
+                ActivityOptions options, AppJumpSession returningSession,
+                AppJumpSession continuingSession) {
             this.sourceTask = sourceTask;
             this.sourcePackage = sourcePackage;
             this.targetPackage = targetPackage;
             this.options = options;
             this.returningSession = returningSession;
+            this.continuingSession = continuingSession;
         }
 
         boolean isReturnToSource() {
@@ -293,6 +301,8 @@ final class MomentController {
         final Task task;
         final Task sourceTask;
         final String sourcePackage;
+        final String targetPackage;
+        final int targetUid;
         final boolean wasExistingTask;
         final MomentAppJumpHandoff<ActivityRecord> handoff;
         boolean dismissCheckScheduled;
@@ -303,8 +313,14 @@ final class MomentController {
             this.task = task;
             sourceTask = launch.sourceTask;
             sourcePackage = launch.sourcePackage;
+            targetPackage = launch.targetPackage;
+            targetUid = entryActivity.getUid();
             wasExistingTask = launch.existingTask != null;
-            handoff = new MomentAppJumpHandoff<>(entryActivity, launch.originalActivities);
+            handoff = launch.continuingSession != null ? launch.continuingSession.handoff
+                    : new MomentAppJumpHandoff<>(entryActivity, launch.originalActivities);
+            if (launch.continuingSession != null) {
+                handoff.onTaskHandoff(launch.originalActivities);
+            }
         }
     }
 
@@ -324,21 +340,30 @@ final class MomentController {
                 callerTask = null;
             }
         }
-        final AppJumpSession returning = callerTask != null
+        AppJumpSession callerSession = callerTask != null
                 ? mAppJumpSessions.get(callerTask.getRootTaskId()) : null;
-        if (returning != null
+        if (callerSession == null && source == null) {
+            callerSession = findRecentAppJumpHandoffLocked(callingPackage, callingUid,
+                    target.packageName, userId);
+            if (callerSession != null) {
+                callerTask = callerSession.task;
+            }
+        }
+        if (callerSession != null
+                && callerSession.targetUid == callingUid
+                && callerSession.targetPackage.equals(callingPackage)
                 && (callerTask.getWindowingMode() == WINDOWING_MODE_MOMENT
-                        || (!returning.autoDismiss
+                        || (!callerSession.autoDismiss
                         && callerTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN))
-                && returning.sourcePackage.equals(target.packageName)
-                && returning.sourceTask.isAttached()
-                && returning.sourceTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
-                && returning.sourceTask.mUserId == userId) {
+                && callerSession.sourcePackage.equals(target.packageName)
+                && callerSession.sourceTask.isAttached()
+                && callerSession.sourceTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+                && callerSession.sourceTask.mUserId == userId) {
             final ActivityOptions returnOptions = copyAppJumpOptions(options);
             returnOptions.setLaunchWindowingMode(WINDOWING_MODE_FULLSCREEN);
             returnOptions.setLaunchBounds(null);
-            return new AppJumpLaunch(returning.sourceTask, returning.sourcePackage,
-                    target.packageName, returnOptions, returning);
+            return new AppJumpLaunch(callerSession.sourceTask, callerSession.sourcePackage,
+                    target.packageName, returnOptions, callerSession);
         }
         if (!mEnabled || !mAppJumpEnabled || mAppJumpUserId != userId
                 || mAppJumpSourcePackages.isEmpty() || !Process.isApplicationUid(callingUid)
@@ -360,6 +385,31 @@ final class MomentController {
                         || options.getLaunchTaskFragmentToken() != null
                         || options.isLaunchIntoPip())) {
             return null;
+        }
+        if (callerSession != null && callerSession.autoDismiss
+                && callerSession.task.getWindowingMode() == WINDOWING_MODE_MOMENT
+                && callerSession.targetUid == callingUid
+                && target.applicationInfo.uid == callingUid
+                && callerSession.targetPackage.equals(callingPackage)
+                && callerSession.targetPackage.equals(target.packageName)
+                && callerSession.sourceTask.isAttached()
+                && callerSession.sourceTask.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+                && callerSession.sourceTask.mUserId == userId
+                && (options == null || options.getLaunchDisplayId() == -1
+                        || options.getLaunchDisplayId() == callerSession.task.getDisplayId())
+                && callerSession.handoff.canHandoffToTask(
+                        callerSession.task.getTopNonFinishingActivity(),
+                        SystemClock.uptimeMillis())
+                && ((intent != null && (intent.getFlags() & Intent.FLAG_ACTIVITY_NEW_TASK) != 0)
+                        || target.launchMode == ActivityInfo.LAUNCH_SINGLE_TASK
+                        || target.launchMode == ActivityInfo.LAUNCH_SINGLE_INSTANCE
+                        || target.launchMode == ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK)) {
+            final ActivityOptions handoffOptions = copyAppJumpOptions(options);
+            handoffOptions.setLaunchWindowingMode(WINDOWING_MODE_MOMENT);
+            handoffOptions.setLaunchDisplayId(callerSession.task.getDisplayId());
+            handoffOptions.setLaunchBounds(callerSession.task.getBounds());
+            return new AppJumpLaunch(callerSession.sourceTask, callerSession.sourcePackage,
+                    target.packageName, handoffOptions, null, callerSession);
         }
         final boolean fromResolver = "com.android.intentresolver".equals(callingPackage)
                 || (source != null && (source.isResolverOrDelegateActivity()
@@ -396,6 +446,31 @@ final class MomentController {
                 launchOptions, null /* returningSession */);
     }
 
+    private AppJumpSession findRecentAppJumpHandoffLocked(String callingPackage, int callingUid,
+            String targetPackage, int userId) {
+        AppJumpSession match = null;
+        final long now = SystemClock.uptimeMillis();
+        for (int i = 0; i < mAppJumpSessions.size(); i++) {
+            final AppJumpSession session = mAppJumpSessions.valueAt(i);
+            if (!session.autoDismiss || session.targetUid != callingUid
+                    || !session.targetPackage.equals(callingPackage)
+                    || (!session.targetPackage.equals(targetPackage)
+                            && !session.sourcePackage.equals(targetPackage))
+                    || session.task.mUserId != userId || !session.task.isAttached()
+                    || session.task.getWindowingMode() != WINDOWING_MODE_MOMENT
+                    || !session.handoff.canHandoffToTask(
+                            session.task.getTopNonFinishingActivity(), now)) {
+                continue;
+            }
+            // Context launches have no Activity token. Never guess between concurrent flows.
+            if (match != null) {
+                return null;
+            }
+            match = session;
+        }
+        return match;
+    }
+
     private static ActivityOptions copyAppJumpOptions(ActivityOptions options) {
         return options != null ? ActivityOptions.fromBundle(options.toBundle())
                 : ActivityOptions.makeBasic();
@@ -427,6 +502,9 @@ final class MomentController {
     }
 
     void onAppJumpTaskResolvedLocked(AppJumpLaunch launch, Task task) {
+        if (launch.continuingSession != null && task == launch.continuingSession.task) {
+            return;
+        }
         if (launch.returningSession == null && task != null) {
             launch.existingTask = task;
             task.forAllActivities(activity -> {
@@ -450,6 +528,24 @@ final class MomentController {
         if (task == null || task == launch.sourceTask
                 || task.getWindowingMode() != WINDOWING_MODE_MOMENT
                 || mAppJumpSessions.containsKey(task.mTaskId)) {
+            return;
+        }
+        if (launch.continuingSession != null) {
+            final AppJumpSession previous = launch.continuingSession;
+            if (mAppJumpSessions.get(previous.task.mTaskId) != previous) {
+                return;
+            }
+            cancelAppJumpDismissLocked(previous);
+            mAppJumpSessions.remove(previous.task.mTaskId);
+            mAppJumpSessions.put(task.mTaskId, new AppJumpSession(task, launch, entry));
+            // Completion and its pending SDK result now belong to the new task. Retire only
+            // the previous container, without reporting a cancel during the handoff.
+            if (previous.wasExistingTask && previous.task.hasChild()) {
+                exitMomentTaskLocked(previous.task, false /* captureSnapshot */);
+                previous.task.moveTaskToBack(previous.task);
+            } else {
+                closeMomentTaskLocked(previous.task);
+            }
             return;
         }
         mAppJumpSessions.put(task.mTaskId, new AppJumpSession(task, launch, entry));
@@ -1813,6 +1909,9 @@ final class MomentController {
             state.prepareForTaskRemoval(task.getSyncTransaction());
         }
         mService.mAtmService.removeTask(task, "close-moment");
+        if (task.isAttached() && !task.hasChild()) {
+            task.removeIfPossible("close-empty-moment");
+        }
     }
 
     private int getDisplayBottomLocked(Task task) {

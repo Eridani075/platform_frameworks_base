@@ -51,6 +51,7 @@ public class MomentAppJumpTests extends WindowTestsBase {
     private static final String SOURCE = "com.test.game";
     private static final String TARGET = "com.test.share";
     private static final int SOURCE_UID = 10001;
+    private static final int TARGET_UID = 10002;
     private MomentController mMoment;
     private ActivityRecord mSource;
     private ActivityInfo mTarget;
@@ -263,10 +264,96 @@ public class MomentAppJumpTests extends WindowTestsBase {
         assertFalse(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(task));
     }
 
+    @Test
+    public void contextSuccessPageMigratesToExistingTaskAndKeepsSourceCallback() {
+        final ActivityRecord entry = createMomentEntry();
+        final Task originalTask = entry.getTask();
+        entry.resultTo = mSource;
+        assertTrue(mMoment.deferAppJumpCanceledResultLocked(entry, RESULT_CANCELED, null));
+        entry.makeFinishingLocked();
+        doReturn(mSource.getTask()).when(mRootWindowContainer).getTopDisplayFocusedRootTask();
+        final MomentController.AppJumpLaunch handoff = prepareContextHandoff(TARGET, TARGET_UID);
+        assertNotNull(handoff);
+        assertFalse(handoff.isReturnToSource());
+        assertEquals(WINDOWING_MODE_MOMENT, handoff.options.getLaunchWindowingMode());
+
+        final ActivityRecord main = new ActivityBuilder(mAtm).setCreateTask(true).setUid(TARGET_UID)
+                .setOnTop(false).setComponent(new ComponentName(TARGET, TARGET + ".Main")).build();
+        final Task task = main.getTask();
+        assertTrue(mMoment.canReuseAppJumpTaskLocked(handoff, task));
+        mMoment.onAppJumpTaskResolvedLocked(handoff, task);
+        task.setWindowingMode(WINDOWING_MODE_MOMENT);
+        mMoment.onAppJumpLaunchSucceededLocked(handoff, main);
+        mMoment.onAppJumpActivityLaunchedLocked(main);
+
+        assertFalse(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(originalTask));
+        assertFalse(main.finishing);
+        final MomentController.AppJumpLaunch callback = prepare(
+                target(SOURCE, SOURCE + ".SdkCallbackActivity"), main, TARGET, TARGET_UID, null);
+        assertNotNull(callback);
+        assertTrue(callback.isReturnToSource());
+        assertSame(mSource.getTask(), callback.sourceTask);
+    }
+
+    @Test
+    public void failedSuccessPageLaunchKeepsOriginalSessionAndRestoresExistingTask() {
+        final ActivityRecord entry = createMomentEntry();
+        entry.makeFinishingLocked();
+        doReturn(mSource.getTask()).when(mRootWindowContainer).getTopDisplayFocusedRootTask();
+        final MomentController.AppJumpLaunch handoff = prepareContextHandoff(TARGET, TARGET_UID);
+        assertNotNull(handoff);
+        final ActivityRecord main = new ActivityBuilder(mAtm).setCreateTask(true).setUid(TARGET_UID)
+                .setOnTop(false).setComponent(new ComponentName(TARGET, TARGET + ".Main")).build();
+        mMoment.onAppJumpTaskResolvedLocked(handoff, main.getTask());
+        main.getTask().setWindowingMode(WINDOWING_MODE_MOMENT);
+        mMoment.onAppJumpLaunchFailedLocked(handoff);
+        assertEquals(WINDOWING_MODE_FULLSCREEN, main.getTask().getWindowingMode());
+        assertFalse(main.finishing);
+        assertTrue(mMoment.shouldDeferEmptyAppJumpTaskRemovalLocked(entry.getTask()));
+    }
+
+    @Test
+    public void contextHandoffRejectsOtherPackagesAndUids() {
+        final ActivityRecord entry = createMomentEntry();
+        entry.makeFinishingLocked();
+        doReturn(mSource.getTask()).when(mRootWindowContainer).getTopDisplayFocusedRootTask();
+        assertNull(prepareContextHandoff("com.test.other", TARGET_UID));
+        assertNull(prepareContextHandoff(TARGET, TARGET_UID + 1));
+    }
+
+    @Test
+    public void contextHandoffDoesNotGuessBetweenConcurrentFlows() {
+        createMomentEntry().makeFinishingLocked();
+        createMomentEntry().makeFinishingLocked();
+        doReturn(mSource.getTask()).when(mRootWindowContainer).getTopDisplayFocusedRootTask();
+        assertNull(prepareContextHandoff(TARGET, TARGET_UID));
+    }
+
+    @Test
+    public void activePageAndManualExpansionDoNotEnableContextTaskHandoff() {
+        final ActivityRecord entry = createMomentEntry();
+        doReturn(mSource.getTask()).when(mRootWindowContainer).getTopDisplayFocusedRootTask();
+        assertNull(prepareContextHandoff(TARGET, TARGET_UID));
+        mMoment.exitMomentTask(entry.getTask().mTaskId);
+        entry.makeFinishingLocked();
+        assertNull(prepareContextHandoff(TARGET, TARGET_UID));
+    }
+
+    private MomentController.AppJumpLaunch prepareContextHandoff(String callingPackage,
+            int callingUid) {
+        final ActivityInfo successPage = target(TARGET, TARGET + ".Main");
+        successPage.applicationInfo.uid = TARGET_UID;
+        successPage.launchMode = ActivityInfo.LAUNCH_SINGLE_TOP;
+        final Intent intent = new Intent().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        return mMoment.prepareAppJumpMomentLaunchLocked(intent, successPage, null,
+                callingPackage, callingUid, 0, null, null, null);
+    }
+
     private ActivityRecord createMomentEntry() {
         final MomentController.AppJumpLaunch launch = prepare(mTarget);
         assertNotNull(launch);
-        final ActivityRecord entry = new ActivityBuilder(mAtm).setCreateTask(true)
+        final ActivityRecord entry = new ActivityBuilder(mAtm).setCreateTask(true).setUid(TARGET_UID)
                 .setComponent(new ComponentName(TARGET, TARGET + ".Share")).build();
         entry.getTask().setWindowingMode(WINDOWING_MODE_MOMENT);
         mMoment.onAppJumpLaunchSucceededLocked(launch, entry);

@@ -41,6 +41,10 @@ final class MomentAppJumpHandoff<T> {
         mSettleDeadline = now + QUIET_PERIOD_MS;
     }
 
+    void onTaskHandoff(Set<T> originalActivities) {
+        mOriginalActivities.addAll(originalActivities);
+    }
+
     void onActivityFinishing(T activity, long now) {
         if (mEntry.equals(activity)) {
             mEntryFinished = true;
@@ -67,6 +71,11 @@ final class MomentAppJumpHandoff<T> {
     boolean shouldDismiss(T top, long now) {
         return mEntryFinished && !mReturnedToSource && !hasFlowActivity(top)
                 && remainingDelay(now) == 0;
+    }
+
+    boolean canHandoffToTask(T top, long now) {
+        return mEntryFinished && !mReturnedToSource && !hasFlowActivity(top)
+                && remainingDelay(now) > 0;
     }
 
     boolean deferCanceledResult(T activity, Runnable result) {

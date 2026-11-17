@@ -134,4 +134,52 @@ public class MomentAppJumpHandoffTests {
         flow.finish();
         assertEquals(1, results.get());
     }
+
+    @Test
+    public void contextTaskHandoffRequiresARecentGapWithoutAnActiveFlowPage() {
+        final MomentAppJumpHandoff<String> flow = new MomentAppJumpHandoff<>("entry", Set.of());
+        assertFalse(flow.canHandoffToTask(null, 1000));
+        flow.onActivityFinishing("entry", 1000);
+        assertTrue(flow.canHandoffToTask(null, 1035));
+        flow.onActivityLaunched("share", 1072);
+        assertFalse(flow.canHandoffToTask("share", 1100));
+        flow.onActivityFinishing("share", 5000);
+        assertTrue(flow.canHandoffToTask(null, 5035));
+        assertFalse(flow.canHandoffToTask(null, 5000 + MomentAppJumpHandoff.QUIET_PERIOD_MS));
+        flow.onReturnToSource();
+        assertFalse(flow.canHandoffToTask(null, 5035));
+    }
+
+    @Test
+    public void successDialogTaskKeepsOriginalResultAndUsesTheRealSdkCallback() {
+        final MomentAppJumpHandoff<String> flow = new MomentAppJumpHandoff<>("entry", Set.of());
+        final AtomicInteger results = new AtomicInteger();
+        flow.deferCanceledResult("entry", results::incrementAndGet);
+        flow.onActivityFinishing("entry", 1000);
+        flow.onActivityFinishing("share", 5000);
+        flow.onTaskHandoff(Set.of("qqMain", "oldChat"));
+        flow.onActivityLaunched("qqMain", 5035);
+        assertFalse(flow.shouldDismiss("qqMain", 9000));
+        assertTrue(flow.shouldDismiss("oldChat", 9000));
+        assertTrue(flow.hasPendingCanceledResult());
+        assertEquals(0, results.get());
+        flow.onReturnToSource();
+        flow.finish();
+        assertEquals(0, results.get());
+    }
+
+    @Test
+    public void cancellationAfterTaskHandoffStillCompletesTheOriginalRequestOnce() {
+        final MomentAppJumpHandoff<String> flow = new MomentAppJumpHandoff<>("entry", Set.of());
+        final AtomicInteger results = new AtomicInteger();
+        flow.deferCanceledResult("entry", results::incrementAndGet);
+        flow.onActivityFinishing("entry", 1000);
+        flow.onTaskHandoff(Set.of("qqMain"));
+        flow.onActivityLaunched("qqMain", 1035);
+        flow.onActivityFinishing("qqMain", 2000);
+        assertTrue(flow.shouldDismiss(null, 2000 + MomentAppJumpHandoff.QUIET_PERIOD_MS));
+        flow.finish();
+        flow.finish();
+        assertEquals(1, results.get());
+    }
 }
