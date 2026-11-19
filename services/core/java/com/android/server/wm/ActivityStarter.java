@@ -1880,6 +1880,9 @@ class ActivityStarter {
             if (mMomentAppJumpLaunch != null) {
                 mService.mWindowManager.mMomentController
                         .onAppJumpLaunchFailedLocked(mMomentAppJumpLaunch);
+            } else {
+                mService.mWindowManager.mMomentController
+                        .onAppJumpBridgeActivityLaunchFailedLocked(mLastStartActivityRecord);
             }
             // If we are not able to proceed, disassociate the activity from the task. Leaving an
             // activity in an incomplete state can lead to issues, such as performing operations
@@ -1911,6 +1914,10 @@ class ActivityStarter {
         } else if (mMomentAppJumpLaunch != null) {
             mService.mWindowManager.mMomentController
                     .onAppJumpLaunchFailedLocked(mMomentAppJumpLaunch);
+        } else if (result != START_SUCCESS && result != START_DELIVERED_TO_TOP
+                && result != START_TASK_TO_FRONT) {
+            mService.mWindowManager.mMomentController
+                    .onAppJumpBridgeActivityLaunchFailedLocked(mLastStartActivityRecord);
         }
         if (result == START_SUCCESS || result == START_DELIVERED_TO_TOP
                 || result == START_TASK_TO_FRONT) {
@@ -2274,6 +2281,10 @@ class ActivityStarter {
         mStartActivity.getTaskFragment().clearLastPausedActivity();
 
         final boolean isTaskSwitch = startedTask != prevTopTask;
+        if (mMomentAppJumpLaunch == null) {
+            mService.mWindowManager.mMomentController
+                    .onAppJumpCandidateActivityStartingLocked(mStartActivity);
+        }
         mTargetRootTask.startActivityLocked(mStartActivity, topRootTask, newTask, isTaskSwitch,
                 mOptions, sourceRecord);
         if (mDoResume) {

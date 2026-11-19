@@ -18,8 +18,17 @@ package com.android.server.wm;
 
 import static android.app.Activity.RESULT_CANCELED;
 import static android.app.Activity.RESULT_OK;
+import static android.app.WindowConfiguration.ACTIVITY_TYPE_HOME;
 import static android.app.WindowConfiguration.WINDOWING_MODE_FULLSCREEN;
 import static android.app.WindowConfiguration.WINDOWING_MODE_MOMENT;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_BEHIND;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+import static android.view.WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
+
+import static com.android.dx.mockito.inline.extended.ExtendedMockito.spyOn;
+import static com.android.server.wm.WindowManagerService.UPDATE_FOCUS_NORMAL;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -27,7 +36,12 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 import android.app.ActivityOptions;
 import android.content.ComponentName;
@@ -35,7 +49,9 @@ import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.graphics.Rect;
+import android.os.SystemClock;
 import android.platform.test.annotations.Presubmit;
+import android.view.Surface;
 
 import androidx.test.filters.SmallTest;
 
@@ -339,6 +355,364 @@ public class MomentAppJumpTests extends WindowTestsBase {
         assertNull(prepareContextHandoff(TARGET, TARGET_UID));
     }
 
+    @Test
+    public void sourceTaskTapOutsideKeepsFocusOnMomentAndBlocksBridgeFocusSteal() {
+        final ActivityRecord assist = new ActivityBuilder(mAtm)
+                .setTask(mSource.getTask())
+                .setUid(SOURCE_UID)
+                .setVisible(true)
+                .setScreenOrientation(SCREEN_ORIENTATION_PORTRAIT)
+                .setComponent(new ComponentName(SOURCE, SOURCE + ".AssistActivity"))
+                .build();
+        final WindowState assistWin = newWindowBuilder("assistWin", TYPE_BASE_APPLICATION)
+                .setWindowToken(assist).build();
+        final ActivityRecord momentEntry = createMomentEntryFrom(assist);
+        final Task momentTask = momentEntry.getTask();
+        final WindowState momentWin = newWindowBuilder("momentWin", TYPE_BASE_APPLICATION)
+                .setWindowToken(momentEntry).build();
+
+        mDisplayContent.setFocusedApp(momentEntry);
+        mWm.updateFocusedWindowLocked(UPDATE_FOCUS_NORMAL, false /* updateInputWindows */);
+        assertSame(momentWin, mDisplayContent.mCurrentFocus);
+        assertSame(momentTask, mMoment.getAppJumpFocusGuardMomentTaskLocked(
+                mSource.getTask(), assist));
+
+        spyOn(mAtm);
+        mWm.handleTaskFocusChange(mSource.getTask(), assist);
+        verify(mAtm, never()).setFocusedTask(eq(mSource.getTask().mTaskId), any());
+        assertSame(momentWin, mDisplayContent.mCurrentFocus);
+
+        // Even if mFocusedApp drifts to AssistActivity, DisplayContent keeps focus on Moment.
+        mDisplayContent.setFocusedApp(assist);
+        assertTrue(mMoment.isAppJumpFocusGuardedAppLocked(momentTask, assist));
+        mWm.updateFocusedWindowLocked(UPDATE_FOCUS_NORMAL, false /* updateInputWindows */);
+        assertSame(momentWin, mDisplayContent.mCurrentFocus);
+
+        // If focus temporarily pointed at AssistActivity, tapping sourceTask redirects back to Moment.
+        clearInvocations(mAtm);
+        mDisplayContent.mCurrentFocus = assistWin;
+        mWm.handleTaskFocusChange(mSource.getTask(), assist);
+        verify(mAtm, never()).setFocusedTask(eq(mSource.getTask().mTaskId), any());
+        verify(mAtm).setFocusedTask(momentTask.mTaskId, momentEntry);
+    }
+
+    @Test
+    public void asyncHandoffGapKeepsSourceTaskFocusGuardActive() {
+        final ActivityRecord assist = new ActivityBuilder(mAtm)
+                .setTask(mSource.getTask())
+                .setUid(SOURCE_UID)
+                .setVisible(true)
+                .setComponent(new ComponentName(SOURCE, SOURCE + ".AssistActivity"))
+                .build();
+        final ActivityRecord momentEntry = createMomentEntryFrom(assist);
+        final Task momentTask = momentEntry.getTask();
+
+        // Simulate the 72ms gap after JumpActivity finishes and before the next page launches.
+        momentEntry.makeFinishingLocked();
+        momentTask.setVisibleRequested(false);
+        assertNull(momentTask.getTopNonFinishingActivity());
+
+        assertSame(momentTask, mMoment.getAppJumpFocusGuardMomentTaskLocked(
+                mSource.getTask(), assist));
+        assertTrue(mMoment.isAppJumpFocusGuardedAppLocked(momentTask, assist));
+    }
+
+    @Test
+    public void compactMomentReleasesRootSourceGuardButKeepsNonRootBridgeGuard() {
+        final ActivityRecord rootMoment = createMomentEntryFrom(mSource);
+        final Task rootMomentTask = rootMoment.getTask();
+        spyOn(mMoment);
+        doReturn(true).when(mMoment).isMomentCompact(rootMomentTask);
+
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(mSource.getTask(), mSource));
+        assertFalse(mMoment.isAppJumpFocusGuardedAppLocked(rootMomentTask, mSource));
+
+        mMoment.onTaskRemoved(rootMomentTask);
+
+        final ActivityRecord assist = new ActivityBuilder(mAtm)
+                .setTask(mSource.getTask())
+                .setUid(SOURCE_UID)
+                .setVisible(true)
+                .setComponent(new ComponentName(SOURCE, SOURCE + ".AssistActivity"))
+                .build();
+        final ActivityRecord bridgeMoment = createMomentEntryFrom(assist);
+        final Task bridgeMomentTask = bridgeMoment.getTask();
+        doReturn(true).when(mMoment).isMomentCompact(bridgeMomentTask);
+
+        assertSame(bridgeMomentTask, mMoment.getAppJumpFocusGuardMomentTaskLocked(
+                mSource.getTask(), assist));
+        assertTrue(mMoment.isAppJumpFocusGuardedAppLocked(bridgeMomentTask, assist));
+    }
+
+    @Test
+    public void escapePathsHomeThirdAppManualExpandAndCleanFinishReleaseFocusGuard() {
+        final ActivityRecord assist = new ActivityBuilder(mAtm)
+                .setTask(mSource.getTask())
+                .setUid(SOURCE_UID)
+                .setVisible(true)
+                .setComponent(new ComponentName(SOURCE, SOURCE + ".AssistActivity"))
+                .build();
+        final WindowState assistWin = newWindowBuilder("assistWin", TYPE_BASE_APPLICATION)
+                .setWindowToken(assist).build();
+        final ActivityRecord momentEntry = createMomentEntryFrom(assist);
+        final Task momentTask = momentEntry.getTask();
+        newWindowBuilder("momentWin", TYPE_BASE_APPLICATION).setWindowToken(momentEntry).build();
+
+        final Task homeTask = createTask(mDisplayContent, WINDOWING_MODE_FULLSCREEN,
+                ACTIVITY_TYPE_HOME);
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(homeTask, null));
+
+        final ActivityRecord thirdApp = new ActivityBuilder(mAtm)
+                .setCreateTask(true)
+                .setVisible(true)
+                .setUid(10099)
+                .setComponent(new ComponentName("com.test.third", "com.test.third.Main"))
+                .build();
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(thirdApp.getTask(), thirdApp));
+
+        spyOn(mAtm);
+        mWm.handleTaskFocusChange(homeTask, null);
+        verify(mAtm).setFocusedTask(homeTask.mTaskId, null);
+
+        clearInvocations(mAtm);
+        mWm.handleTaskFocusChange(thirdApp.getTask(), thirdApp);
+        verify(mAtm).setFocusedTask(thirdApp.getTask().mTaskId, thirdApp);
+
+        // Manual expand ends ownership and lets sourceTask regain window focus.
+        mMoment.exitMomentTask(momentTask.mTaskId);
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(mSource.getTask(), assist));
+        assertFalse(mMoment.isAppJumpFocusGuardedAppLocked(momentTask, assist));
+        mSource.getTask().moveToFront("test");
+        mDisplayContent.setFocusedApp(assist);
+        mWm.updateFocusedWindowLocked(UPDATE_FOCUS_NORMAL, false /* updateInputWindows */);
+        assertSame(assistWin, mDisplayContent.mCurrentFocus);
+
+        // Clean return to source clears focus guard immediately.
+        final ActivityRecord momentEntry2 = createMomentEntryFrom(assist);
+        assertSame(momentEntry2.getTask(), mMoment.getAppJumpFocusGuardMomentTaskLocked(
+                mSource.getTask(), assist));
+        final ActivityInfo callback = target(SOURCE, SOURCE + ".wxapi.WXEntryActivity");
+        final MomentController.AppJumpLaunch returning = prepare(callback, momentEntry2,
+                TARGET, momentEntry2.getUid(), null);
+        assertNotNull(returning);
+        mMoment.onAppJumpLaunchSucceededLocked(returning, assist);
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(mSource.getTask(), assist));
+        mMoment.onTaskRemoved(momentEntry2.getTask());
+
+        // Clean Task removal clears focus guard immediately.
+        final ActivityRecord momentEntry3 = createMomentEntryFrom(assist);
+        assertSame(momentEntry3.getTask(), mMoment.getAppJumpFocusGuardMomentTaskLocked(
+                mSource.getTask(), assist));
+        mMoment.onTaskRemoved(momentEntry3.getTask());
+        assertNull(mMoment.getAppJumpFocusGuardMomentTaskLocked(mSource.getTask(), assist));
+    }
+
+    @Test
+    public void landscapeSourceTranslucentPortraitBridgeStaysLandscapeAcrossPhaseBPhaseAAndExitGrace() {
+        final String pkg = mContext.getPackageName();
+        mMoment.setAppJumpSettingsFromSettings(0, true, pkg);
+        final ActivityRecord landscapeGame = createLandscapeGame(pkg);
+
+        // Call setActivityTheme before setVisible(false) so AttributeCache resolves Theme_Translucent
+        // on the real test package without keeping mStyleFillsParent=true.
+        final ActivityRecord translucentBridge = new ActivityBuilder(mAtm)
+                .setTask(landscapeGame.getTask())
+                .setActivityTheme(android.R.style.Theme_Translucent)
+                .setUid(SOURCE_UID)
+                .setScreenOrientation(SCREEN_ORIENTATION_PORTRAIT)
+                .setVisible(false)
+                .build();
+        assertFalse(translucentBridge.mStyleFillsParent);
+        assertFalse(translucentBridge.occludesParent());
+
+        mMoment.onAppJumpCandidateActivityStartingLocked(translucentBridge);
+        makeBridgeVisible(translucentBridge);
+        mDisplayContent.updateOrientation();
+
+        assertFalse(mMoment.shouldHoldBridgeRotationLocked(translucentBridge));
+        assertEquals(SCREEN_ORIENTATION_BEHIND, translucentBridge.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+        // Phase A: Moment session active.
+        final ActivityRecord momentEntry = createMomentEntryFrom(translucentBridge);
+        assertEquals(SCREEN_ORIENTATION_BEHIND, translucentBridge.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+        // Returning to source ends Moment session and arms 400ms post-session exit grace.
+        final ActivityInfo callback = target(pkg, pkg + ".wxapi.WXEntryActivity");
+        final MomentController.AppJumpLaunch returning = prepare(callback, momentEntry,
+                TARGET, momentEntry.getUid(), null);
+        assertNotNull(returning);
+        mMoment.onAppJumpLaunchSucceededLocked(returning, translucentBridge);
+
+        assertEquals(SCREEN_ORIENTATION_BEHIND, translucentBridge.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+        translucentBridge.makeFinishingLocked();
+        mDisplayContent.updateOrientation();
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+    }
+
+    @Test
+    public void landscapeSourceOpaqueAssistPortraitAndUnspecifiedStayLandscapeThroughExitGrace() {
+        final ActivityRecord landscapeGame = createLandscapeGame(SOURCE);
+
+        for (int bridgeOrientation : new int[] {
+                SCREEN_ORIENTATION_PORTRAIT,
+                SCREEN_ORIENTATION_UNSPECIFIED
+        }) {
+            final ActivityRecord assist = createBridgeInTask(landscapeGame.getTask(),
+                    SOURCE + ".AssistActivity", bridgeOrientation);
+            mMoment.onAppJumpCandidateActivityStartingLocked(assist);
+            makeBridgeVisible(assist);
+            mDisplayContent.updateOrientation();
+
+            assertEquals(SCREEN_ORIENTATION_BEHIND, assist.getOverrideOrientation());
+            assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+            final ActivityRecord moment = createMomentEntryFrom(assist);
+            assertEquals(SCREEN_ORIENTATION_BEHIND, assist.getOverrideOrientation());
+            assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+            mMoment.onTaskRemoved(moment.getTask());
+            assertEquals(SCREEN_ORIENTATION_BEHIND, assist.getOverrideOrientation());
+            assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+            assist.makeFinishingLocked();
+            mDisplayContent.updateOrientation();
+            assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+        }
+    }
+
+    @Test
+    public void unmatchedOpaquePortraitSubActivityReleasesTier2HoldAfter150MsAndRotates() {
+        final ActivityRecord landscapeGame = createLandscapeGame(SOURCE);
+
+        final ActivityRecord subActivity = createBridgeInTask(landscapeGame.getTask(),
+                SOURCE + ".SourceSubActivity", SCREEN_ORIENTATION_PORTRAIT);
+        mMoment.onAppJumpCandidateActivityStartingLocked(subActivity);
+        makeBridgeVisible(subActivity);
+
+        assertEquals(SCREEN_ORIENTATION_PORTRAIT, subActivity.getOverrideOrientation());
+        assertTrue(mMoment.shouldHoldBridgeRotationLocked(subActivity));
+        assertFalse(mDisplayContent.updateOrientation());
+
+        mDisplayContent.setFixedRotationLaunchingApp(subActivity, Surface.ROTATION_0);
+        mDisplayContent.continueUpdateOrientationForDiffOrienLaunchingApp();
+        assertTrue(mDisplayContent.isFixedRotationLaunchingApp(subActivity));
+
+        SystemClock.sleep(180);
+        waitUntilHandlersIdle();
+
+        assertFalse(mMoment.shouldHoldBridgeRotationLocked(subActivity));
+        assertFalse(mDisplayContent.isFixedRotationLaunchingApp(subActivity));
+        assertEquals(SCREEN_ORIENTATION_PORTRAIT, mDisplayContent.getOrientation());
+    }
+
+    @Test
+    public void tier2HoldUpgradesToPhaseAAndClearsFixedRotationWhenMomentLaunches() {
+        final ActivityRecord landscapeGame = createLandscapeGame(SOURCE);
+
+        final ActivityRecord obfuscatedBridge = createBridgeInTask(landscapeGame.getTask(),
+                SOURCE + ".ObfuscatedBridgeActivity", SCREEN_ORIENTATION_PORTRAIT);
+        mMoment.onAppJumpCandidateActivityStartingLocked(obfuscatedBridge);
+        makeBridgeVisible(obfuscatedBridge);
+        mDisplayContent.setFixedRotationLaunchingApp(obfuscatedBridge, Surface.ROTATION_0);
+        assertTrue(mMoment.shouldHoldBridgeRotationLocked(obfuscatedBridge));
+        assertTrue(mDisplayContent.isFixedRotationLaunchingApp(obfuscatedBridge));
+
+        createMomentEntryFrom(obfuscatedBridge);
+
+        assertFalse(mMoment.shouldHoldBridgeRotationLocked(obfuscatedBridge));
+        assertFalse(mDisplayContent.isFixedRotationLaunchingApp(obfuscatedBridge));
+        assertEquals(SCREEN_ORIENTATION_BEHIND, obfuscatedBridge.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+    }
+
+    @Test
+    public void setRequestedOrientationBehindWhileProtectedUpdatesRawOverrideOrientation() {
+        final ActivityRecord landscapeGame = createLandscapeGame(SOURCE);
+
+        final ActivityRecord assistPortrait = createBridgeInTask(landscapeGame.getTask(),
+                SOURCE + ".AssistActivity", SCREEN_ORIENTATION_PORTRAIT);
+        mMoment.onAppJumpCandidateActivityStartingLocked(assistPortrait);
+        makeBridgeVisible(assistPortrait);
+
+        assertEquals(SCREEN_ORIENTATION_PORTRAIT, assistPortrait.getRawOverrideOrientationLocked());
+        assertEquals(SCREEN_ORIENTATION_BEHIND, assistPortrait.getOverrideOrientation());
+
+        assistPortrait.setRequestedOrientation(SCREEN_ORIENTATION_BEHIND);
+
+        assertEquals(SCREEN_ORIENTATION_BEHIND, assistPortrait.getRawOverrideOrientationLocked());
+        assertEquals(SCREEN_ORIENTATION_BEHIND, assistPortrait.getRequestedOrientation());
+
+        mMoment.setEnabledFromSettings(false);
+        assertEquals(SCREEN_ORIENTATION_BEHIND, assistPortrait.getOverrideOrientation());
+    }
+
+    @Test
+    public void chooserVisibleExtendsPhaseBBridgeProtection() {
+        final ActivityRecord landscapeGame = createLandscapeGame(SOURCE);
+
+        final ActivityRecord assistPortrait = createBridgeInTask(landscapeGame.getTask(),
+                SOURCE + ".AssistActivity", SCREEN_ORIENTATION_PORTRAIT);
+        mMoment.onAppJumpCandidateActivityStartingLocked(assistPortrait);
+        makeBridgeVisible(assistPortrait);
+
+        final ActivityRecord chooser = new ActivityBuilder(mAtm)
+                .setCreateTask(true)
+                .setVisible(true)
+                .setActivityTheme(android.R.style.Theme_Translucent)
+                .setComponent(new ComponentName("android",
+                        "com.android.internal.app.ResolverActivity"))
+                .build();
+        assertTrue(chooser.isResolverOrDelegateActivity());
+        assertFalse(chooser.providesOrientation());
+
+        SystemClock.sleep(430);
+        waitUntilHandlersIdle();
+
+        assertEquals(SCREEN_ORIENTATION_BEHIND, assistPortrait.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_SENSOR_LANDSCAPE, mDisplayContent.getOrientation());
+
+        chooser.makeFinishingLocked();
+        SystemClock.sleep(430);
+        waitUntilHandlersIdle();
+
+        assertEquals(SCREEN_ORIENTATION_PORTRAIT, assistPortrait.getOverrideOrientation());
+        assertEquals(SCREEN_ORIENTATION_PORTRAIT, mDisplayContent.getOrientation());
+    }
+
+    private ActivityRecord createLandscapeGame(String pkg) {
+        mDisplayContent.setIgnoreOrientationRequest(false);
+        resizeDisplay(mDisplayContent, 2000, 1000);
+        final ActivityRecord landscapeGame = new ActivityBuilder(mAtm)
+                .setCreateTask(true)
+                .setVisible(true)
+                .setUid(SOURCE_UID)
+                .setScreenOrientation(SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
+                .setComponent(new ComponentName(pkg, pkg + ".LandscapeGame"))
+                .build();
+        landscapeGame.getTask().setWindowingMode(WINDOWING_MODE_FULLSCREEN);
+        return landscapeGame;
+    }
+
+    private ActivityRecord createBridgeInTask(Task task, String className, int screenOrientation) {
+        return new ActivityBuilder(mAtm)
+                .setTask(task)
+                .setUid(SOURCE_UID)
+                .setComponent(new ComponentName(SOURCE, className))
+                .setScreenOrientation(screenOrientation)
+                .setVisible(false)
+                .build();
+    }
+
+    private static void makeBridgeVisible(ActivityRecord bridge) {
+        bridge.setVisibility(true);
+        bridge.setVisibleRequested(true);
+        bridge.setVisible(true);
+    }
+
     private MomentController.AppJumpLaunch prepareContextHandoff(String callingPackage,
             int callingUid) {
         final ActivityInfo successPage = target(TARGET, TARGET + ".Main");
@@ -351,11 +725,21 @@ public class MomentAppJumpTests extends WindowTestsBase {
     }
 
     private ActivityRecord createMomentEntry() {
-        final MomentController.AppJumpLaunch launch = prepare(mTarget);
+        return createMomentEntryFrom(mSource);
+    }
+
+    private ActivityRecord createMomentEntryFrom(ActivityRecord source) {
+        final MomentController.AppJumpLaunch launch = prepare(
+                mTarget, source, source.packageName, source.getUid(), null);
         assertNotNull(launch);
-        final ActivityRecord entry = new ActivityBuilder(mAtm).setCreateTask(true).setUid(TARGET_UID)
-                .setComponent(new ComponentName(TARGET, TARGET + ".Share")).build();
+        final ActivityRecord entry = new ActivityBuilder(mAtm)
+                .setCreateTask(true)
+                .setVisible(true)
+                .setUid(TARGET_UID)
+                .setComponent(new ComponentName(TARGET, TARGET + ".Share"))
+                .build();
         entry.getTask().setWindowingMode(WINDOWING_MODE_MOMENT);
+        entry.getTask().moveToFront("createMomentEntryFrom");
         mMoment.onAppJumpLaunchSucceededLocked(launch, entry);
         return entry;
     }

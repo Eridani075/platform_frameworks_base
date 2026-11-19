@@ -9919,6 +9919,22 @@ public class WindowManagerService extends IWindowManager.Stub
         }
 
         final ActivityRecord touchedApp = t.getActivityRecord();
+        final Task touchedTask = getTaskForInputTarget(t);
+        final Task guardMomentTask = mMomentController.getAppJumpFocusGuardMomentTaskLocked(
+                touchedTask, touchedApp);
+        if (guardMomentTask != null) {
+            final Task focusedInputTask = getTaskForInputTarget(mFocusedInputTarget);
+            final WindowState curFocusedWindow = getFocusedWindowLocked();
+            final Task curFocusedTask = curFocusedWindow != null
+                    ? curFocusedWindow.getTask() : null;
+            if (focusedInputTask != null && focusedInputTask.getRootTask() == guardMomentTask
+                    && (curFocusedWindow == null
+                            || (curFocusedTask != null
+                                    && curFocusedTask.getRootTask() == guardMomentTask))) {
+                return;
+            }
+        }
+
         if (touchedApp != null && touchedApp.getTask() != null) {
             final ActivityRecord top = touchedApp.getTask().topRunningActivity();
             if (top != null && top != touchedApp && top.getTaskFragment().getBounds().contains(
@@ -9960,6 +9976,19 @@ public class WindowManagerService extends IWindowManager.Stub
         } else {
             handlePointerDownOutsideFocus(t, focusedInputTarget);
         }
+    }
+
+    @Nullable
+    private static Task getTaskForInputTarget(@Nullable InputTarget target) {
+        if (target == null) {
+            return null;
+        }
+        final ActivityRecord activity = target.getActivityRecord();
+        if (activity != null) {
+            return activity.getTask();
+        }
+        final WindowState win = target.getWindowState();
+        return win != null ? win.getTask() : null;
     }
 
     private boolean shouldDelayTouchOutside(InputTarget t) {
@@ -10081,6 +10110,20 @@ public class WindowManagerService extends IWindowManager.Stub
                     }
                 }
             }
+        }
+
+        final Task guardMomentTask = mMomentController.getAppJumpFocusGuardMomentTaskLocked(
+                task, touchedActivity);
+        if (guardMomentTask != null) {
+            final Task focusedRootTask = focusedTask != null ? focusedTask.getRootTask() : null;
+            if (focusedRootTask != guardMomentTask) {
+                final ActivityRecord momentTop = guardMomentTask.topRunningActivity(
+                        true /* focusableOnly */);
+                if (momentTop != null) {
+                    mAtmService.setFocusedTask(guardMomentTask.mTaskId, momentTop);
+                }
+            }
+            return;
         }
 
         mAtmService.setFocusedTask(task.mTaskId, touchedActivity);
